@@ -446,7 +446,10 @@ def build_prompt(job: dict, tailored_resume: str,
     if not resume_path:
         raise ValueError(f"No tailored resume for job: {job.get('title', 'unknown')}")
 
-    src_pdf = Path(resume_path).with_suffix(".pdf").resolve()
+    src_pdf = Path(resume_path).with_suffix(".pdf")
+    # Remap paths from other machines (e.g. Mac path copied to Linux)
+    if not src_pdf.exists():
+        src_pdf = config.TAILORED_DIR / src_pdf.name
     if not src_pdf.exists():
         raise ValueError(f"Resume PDF not found: {src_pdf}")
 
@@ -463,6 +466,11 @@ def build_prompt(job: dict, tailored_resume: str,
     cover_letter_text = cover_letter or ""
     cl_upload_path = ""
     cl_path = job.get("cover_letter_path")
+    # Remap cover letter path from other machines
+    if cl_path and not Path(cl_path).exists():
+        remapped = config.COVER_LETTER_DIR / Path(cl_path).name
+        if remapped.exists():
+            cl_path = str(remapped)
     if cl_path and Path(cl_path).exists():
         cl_src = Path(cl_path)
         # Read text from .txt sibling (PDF is binary)
