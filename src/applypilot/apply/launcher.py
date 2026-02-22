@@ -1,7 +1,7 @@
-"""Apply orchestration: acquire jobs, spawn Claude Code sessions, track results.
+"""Apply orchestration: acquire jobs, spawn Codex CLI sessions, track results.
 
 This is the main entry point for the apply pipeline. It pulls jobs from
-the database, launches Chrome + Claude Code for each one, parses the
+the database, launches Chrome + Codex for each one, parses the
 result, and updates the database. Supports parallel workers via --workers.
 """
 
@@ -49,9 +49,9 @@ POLL_INTERVAL = config.DEFAULTS["poll_interval"]
 # Thread-safe shutdown coordination
 _stop_event = threading.Event()
 
-# Track active Claude Code processes for skip (Ctrl+C) handling
-_claude_procs: dict[int, subprocess.Popen] = {}
-_claude_lock = threading.Lock()
+# Track active Codex CLI processes for skip (Ctrl+C) handling
+_codex_procs: dict[int, subprocess.Popen] = {}
+_codex_lock = threading.Lock()
 
 # Register cleanup on exit
 atexit.register(cleanup_on_exit)
@@ -63,24 +63,56 @@ if platform.system() != "Windows":
 # MCP config
 # ---------------------------------------------------------------------------
 
-def _make_mcp_config(cdp_port: int) -> dict:
-    """Build MCP config dict for a specific CDP port."""
-    return {
-        "mcpServers": {
-            "playwright": {
-                "command": "npx",
-                "args": [
-                    "@playwright/mcp@latest",
-                    f"--cdp-endpoint=http://localhost:{cdp_port}",
-                    f"--viewport-size={config.DEFAULTS['viewport']}",
-                ],
-            },
-            "gmail": {
-                "command": "npx",
-                "args": ["-y", "@gongrzhe/server-gmail-autoauth-mcp"],
-            },
-        }
-    }
+def _setup_mcp_servers(cdp_port: int) -> None:
+    """Register MCP servers for Codex using `codex mcp add`.
+
+    Codex reads MCP config from ~/.codex/config.toml. We use the CLI
+    to add/update servers with the correct CDP port for this worker.
+    """
+    viewport = config.DEFAULTS['viewport']
+
+    # Remove existing playwright server (ignore if not present)
+    subprocess.run(
+        ["codex", "mcp", "remove", "playwright"],
+        capture_output=True, text=True,
+    )
+    # Add playwright with the correct CDP endpoint for this worker
+    subprocess.run(
+        ["codex", "mcp", "add", "playwright", "--",
+         "npx", "@playwright/mcp@latest",
+         f"--cdp-endpoint=http://localhost:{cdp_port}",
+         f"--viewport-size={viewport}"],
+        capture_output=True, text=True, check=True,
+    )
+
+    # Add gmail server (idempotent — remove first, then add)
+    subprocess.run(
+        ["codex", "mcp", "remove", "gmail"],
+        capture_output=True, text=True,
+    )
+    subprocess.run(
+        ["codex", "mcp", "add", "gmail", "--",
+         "npx", "-y", "@gongrzhe/server-gmail-autoauth-mcp"],
+        capture_output=True, text=True, check=True,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Model mapping (Claude model names -> Codex-compatible models)
+# ---------------------------------------------------------------------------
+
+_MODEL_MAP = {
+    "haiku": "auto",
+    "sonnet": "auto",
+    "opus": "auto",
+}
+
+def _map_model(model: str) -> str:
+    """Map legacy Claude model names to Codex-compatible model names.
+
+    Returns the mapped name, or 'auto' to let Codex use its default.
+    """
+    return _MODEL_MAP.get(model, model)
 
 
 # ---------------------------------------------------------------------------
@@ -212,7 +244,7 @@ def release_lock(url: str) -> None:
 
 def gen_prompt(target_url: str, min_score: int = 7,
                model: str = "sonnet", worker_id: int = 0) -> Path | None:
-    """Generate a prompt file and print the Claude CLI command for manual debugging.
+    """Generate a prompt file and print the Codex CLI command for manual debugging.
 
     Returns:
         Path to the generated prompt file, or None if no job found.
@@ -228,7 +260,8 @@ def gen_prompt(target_url: str, min_score: int = 7,
     if txt_path and txt_path.exists():
         resume_text = txt_path.read_text(encoding="utf-8")
 
-    prompt = prompt_mod.build_prompt(job=job, tailored_resume=resume_text)
+    port = BASE_CDP_PORT + worker_id
+    prompt = prompt_mod.build_prompt(job=job, tailored_resume=resume_text, cdp_port=port)
 
     # Release the lock so the job stays available
     release_lock(job["url"])
@@ -239,10 +272,8 @@ def gen_prompt(target_url: str, min_score: int = 7,
     prompt_file = config.LOG_DIR / f"prompt_{site_slug}_{job['title'][:30].replace(' ', '_')}.txt"
     prompt_file.write_text(prompt, encoding="utf-8")
 
-    # Write MCP config for reference
-    port = BASE_CDP_PORT + worker_id
-    mcp_path = config.APP_DIR / f".mcp-apply-{worker_id}.json"
-    mcp_path.write_text(json.dumps(_make_mcp_config(port)), encoding="utf-8")
+    # Register MCP servers for Codex
+    _setup_mcp_servers(port)
 
     return prompt_file
 
@@ -296,7 +327,7 @@ def reset_failed() -> int:
 
 def run_job(job: dict, port: int, worker_id: int = 0,
             model: str = "sonnet", dry_run: bool = False) -> tuple[str, int]:
-    """Spawn a Claude Code session for one job application.
+    """Spawn a Codex CLI session for one job application.
 
     Returns:
         Tuple of (status_string, duration_ms). Status is one of:
@@ -315,39 +346,29 @@ def run_job(job: dict, port: int, worker_id: int = 0,
         job=job,
         tailored_resume=resume_text,
         dry_run=dry_run,
+        cdp_port=port,
     )
 
-    # Write per-worker MCP config
-    mcp_config_path = config.APP_DIR / f".mcp-apply-{worker_id}.json"
-    mcp_config_path.write_text(json.dumps(_make_mcp_config(port)), encoding="utf-8")
+    worker_dir = reset_worker_dir(worker_id)
 
-    # Build claude command
+    # Register MCP servers for Codex (updates ~/.codex/config.toml)
+    _setup_mcp_servers(port)
+
+    # Build codex command
+    codex_model = _map_model(model)
     cmd = [
-        "claude",
-        "--model", model,
-        "-p",
-        "--mcp-config", str(mcp_config_path),
-        "--permission-mode", "bypassPermissions",
-        "--no-session-persistence",
-        "--disallowedTools", (
-            "mcp__gmail__draft_email,mcp__gmail__modify_email,"
-            "mcp__gmail__delete_email,mcp__gmail__download_attachment,"
-            "mcp__gmail__batch_modify_emails,mcp__gmail__batch_delete_emails,"
-            "mcp__gmail__create_label,mcp__gmail__update_label,"
-            "mcp__gmail__delete_label,mcp__gmail__get_or_create_label,"
-            "mcp__gmail__list_email_labels,mcp__gmail__create_filter,"
-            "mcp__gmail__list_filters,mcp__gmail__get_filter,"
-            "mcp__gmail__delete_filter"
-        ),
-        "--output-format", "stream-json",
-        "--verbose", "-",
+        "codex", "exec",
+        "--dangerously-bypass-approvals-and-sandbox",
+        "--ephemeral",
+        "--json",
+        "--skip-git-repo-check",
+        "-C", str(worker_dir),
     ]
+    if codex_model and codex_model != "auto":
+        cmd.extend(["--model", codex_model])
+    cmd.append("-")
 
     env = os.environ.copy()
-    env.pop("CLAUDECODE", None)
-    env.pop("CLAUDE_CODE_ENTRYPOINT", None)
-
-    worker_dir = reset_worker_dir(worker_id)
 
     update_state(worker_id, status="applying", job_title=job["title"],
                  company=job.get("site", ""), score=job.get("fit_score", 0),
@@ -380,8 +401,8 @@ def run_job(job: dict, port: int, worker_id: int = 0,
             env=env,
             cwd=str(worker_dir),
         )
-        with _claude_lock:
-            _claude_procs[worker_id] = proc
+        with _codex_lock:
+            _codex_procs[worker_id] = proc
 
         proc.stdin.write(agent_prompt)
         proc.stdin.close()
@@ -397,7 +418,105 @@ def run_job(job: dict, port: int, worker_id: int = 0,
                 try:
                     msg = json.loads(line)
                     msg_type = msg.get("type")
-                    if msg_type == "assistant":
+
+                    # --- Codex JSONL event parsing ---
+
+                    # Message content (text from the agent)
+                    if msg_type == "message" or msg_type == "item.completed":
+                        item = msg.get("item", msg)
+                        item_type = item.get("type", "")
+
+                        # Text content from agent messages
+                        if item_type in ("message", "agent_message", ""):
+                            # Codex puts text directly on item, Claude nests in content blocks
+                            if "text" in item and isinstance(item["text"], str):
+                                text_parts.append(item["text"])
+                                lf.write(item["text"] + "\n")
+                            for block in item.get("content", []):
+                                bt = block.get("type", "")
+                                if bt == "text" or bt == "output_text":
+                                    text = block.get("text", block.get("value", ""))
+                                    text_parts.append(text)
+                                    lf.write(text + "\n")
+
+                        # MCP tool call completed
+                        if item_type == "mcp_tool_call":
+                            name = (
+                                item.get("name", item.get("tool_name", ""))
+                                .replace("mcp__playwright__", "")
+                                .replace("mcp__gmail__", "gmail:")
+                            )
+                            args = item.get("arguments", item.get("input", {}))
+                            if isinstance(args, str):
+                                try:
+                                    args = json.loads(args)
+                                except (json.JSONDecodeError, TypeError):
+                                    args = {}
+                            if "url" in args:
+                                desc = f"{name} {args['url'][:60]}"
+                            elif "ref" in args:
+                                desc = f"{name} {args.get('element', args.get('text', ''))}"[:50]
+                            elif "fields" in args:
+                                desc = f"{name} ({len(args['fields'])} fields)"
+                            elif "paths" in args:
+                                desc = f"{name} upload"
+                            else:
+                                desc = name
+
+                            lf.write(f"  >> {desc}\n")
+                            ws = get_state(worker_id)
+                            cur_actions = ws.actions if ws else 0
+                            update_state(worker_id,
+                                         actions=cur_actions + 1,
+                                         last_action=desc[:35])
+
+                        # Command execution (shell commands)
+                        if item_type == "command_execution":
+                            cmd_text = item.get("command", item.get("call_id", "shell"))
+                            desc = f"exec: {str(cmd_text)[:50]}"
+                            lf.write(f"  >> {desc}\n")
+                            ws = get_state(worker_id)
+                            cur_actions = ws.actions if ws else 0
+                            update_state(worker_id,
+                                         actions=cur_actions + 1,
+                                         last_action=desc[:35])
+
+                    # MCP tool call started (just log it)
+                    elif msg_type == "item.started":
+                        item = msg.get("item", {})
+                        if item.get("type") == "mcp_tool_call":
+                            name = (
+                                item.get("name", item.get("tool_name", ""))
+                                .replace("mcp__playwright__", "")
+                                .replace("mcp__gmail__", "gmail:")
+                            )
+                            lf.write(f"  >> [starting] {name}\n")
+
+                    # Turn completed — extract usage stats
+                    elif msg_type == "turn.completed":
+                        usage = msg.get("usage", {})
+                        stats = {
+                            "input_tokens": usage.get("input_tokens", 0),
+                            "output_tokens": usage.get("output_tokens", 0),
+                            "cache_read": usage.get("cache_read_input_tokens", 0),
+                            "cache_create": usage.get("cache_creation_input_tokens", 0),
+                            "cost_usd": msg.get("total_cost_usd", msg.get("cost_usd", 0)),
+                            "turns": msg.get("num_turns", 1),
+                        }
+                        # The final message content is often in the turn
+                        result_text = msg.get("result", msg.get("text", ""))
+                        if result_text:
+                            text_parts.append(result_text)
+
+                    # Turn failed
+                    elif msg_type == "turn.failed":
+                        err = msg.get("error", {})
+                        err_msg = err.get("message", str(err)) if isinstance(err, dict) else str(err)
+                        text_parts.append(f"RESULT:FAILED:{err_msg}")
+                        lf.write(f"  !! Turn failed: {err_msg}\n")
+
+                    # Claude-compatible fallback (in case output format is similar)
+                    elif msg_type == "assistant":
                         for block in msg.get("message", {}).get("content", []):
                             bt = block.get("type")
                             if bt == "text":
@@ -420,7 +539,6 @@ def run_job(job: dict, port: int, worker_id: int = 0,
                                     desc = f"{name} upload"
                                 else:
                                     desc = name
-
                                 lf.write(f"  >> {desc}\n")
                                 ws = get_state(worker_id)
                                 cur_actions = ws.actions if ws else 0
@@ -437,6 +555,7 @@ def run_job(job: dict, port: int, worker_id: int = 0,
                             "turns": msg.get("num_turns", 0),
                         }
                         text_parts.append(msg.get("result", ""))
+
                 except json.JSONDecodeError:
                     text_parts.append(line)
                     lf.write(line + "\n")
@@ -453,7 +572,7 @@ def run_job(job: dict, port: int, worker_id: int = 0,
         duration_ms = int((time.time() - start) * 1000)
 
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        job_log = config.LOG_DIR / f"claude_{ts}_w{worker_id}_{job.get('site', 'unknown')[:20]}.txt"
+        job_log = config.LOG_DIR / f"codex_{ts}_w{worker_id}_{job.get('site', 'unknown')[:20]}.txt"
         job_log.write_text(output, encoding="utf-8")
 
         if stats:
@@ -509,8 +628,8 @@ def run_job(job: dict, port: int, worker_id: int = 0,
         update_state(worker_id, status="failed", last_action=f"ERROR: {str(e)[:25]}")
         return f"failed:{str(e)[:100]}", duration_ms
     finally:
-        with _claude_lock:
-            _claude_procs.pop(worker_id, None)
+        with _codex_lock:
+            _codex_procs.pop(worker_id, None)
         if proc is not None and proc.poll() is None:
             _kill_process_tree(proc.pid)
 
@@ -697,16 +816,16 @@ def main(limit: int = 1, target_url: str | None = None,
         _ctrl_c_count += 1
         if _ctrl_c_count == 1:
             console.print("\n[yellow]Skipping current job(s)... (Ctrl+C again to STOP)[/yellow]")
-            # Kill all active Claude processes to skip current jobs
-            with _claude_lock:
-                for wid, cproc in list(_claude_procs.items()):
+            # Kill all active Codex processes to skip current jobs
+            with _codex_lock:
+                for wid, cproc in list(_codex_procs.items()):
                     if cproc.poll() is None:
                         _kill_process_tree(cproc.pid)
         else:
             console.print("\n[red bold]STOPPING[/red bold]")
             _stop_event.set()
-            with _claude_lock:
-                for wid, cproc in list(_claude_procs.items()):
+            with _codex_lock:
+                for wid, cproc in list(_codex_procs.items()):
                     if cproc.poll() is None:
                         _kill_process_tree(cproc.pid)
             kill_all_chrome()

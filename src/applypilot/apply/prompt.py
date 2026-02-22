@@ -1,6 +1,6 @@
 """Prompt builder for the autonomous job application agent.
 
-Constructs the full instruction prompt that tells Claude Code / the AI agent
+Constructs the full instruction prompt that tells the AI agent (Codex CLI)
 how to fill out a job application form using Playwright MCP tools. All
 personal data is loaded from the user's profile -- nothing is hardcoded.
 """
@@ -421,7 +421,8 @@ If CapSolver genuinely failed (errorId > 0):
 
 def build_prompt(job: dict, tailored_resume: str,
                  cover_letter: str | None = None,
-                 dry_run: bool = False) -> str:
+                 dry_run: bool = False,
+                 cdp_port: int = 9222) -> str:
     """Build the full instruction prompt for the apply agent.
 
     Loads the user profile and search config internally. All personal data
@@ -433,6 +434,7 @@ def build_prompt(job: dict, tailored_resume: str,
         tailored_resume: Plain-text content of the tailored resume.
         cover_letter: Optional plain-text cover letter content.
         dry_run: If True, tell the agent not to click Submit.
+        cdp_port: Chrome DevTools Protocol port for the pre-launched browser.
 
     Returns:
         Complete prompt string for the AI agent.
@@ -524,6 +526,36 @@ def build_prompt(job: dict, tailored_resume: str,
         submit_instruction = "BEFORE clicking Submit/Apply, take a snapshot and review EVERY field on the page. Verify all data matches the APPLICANT PROFILE and TAILORED RESUME -- name, email, phone, location, work auth, resume uploaded, cover letter if applicable. If anything is wrong or missing, fix it FIRST. Only click Submit after confirming everything is correct."
 
     prompt = f"""You are an autonomous job application agent. Your ONE mission: get this candidate an interview. You have all the information and tools. Think strategically. Act decisively. Submit the application.
+
+== BROWSER SETUP (CRITICAL -- read this first) ==
+A Chrome browser is already running and connected via CDP at: http://localhost:{cdp_port}
+Do NOT launch a new browser. Connect to the existing one using Playwright's connect_over_cdp.
+
+Use Python scripts via shell to interact with the browser. Here is the pattern:
+
+```python
+from playwright.sync_api import sync_playwright
+with sync_playwright() as p:
+    browser = p.chromium.connect_over_cdp("http://localhost:{cdp_port}")
+    context = browser.contexts[0]  # reuse existing context
+    page = context.pages[0] if context.pages else context.new_page()
+    # Now use page.goto(), page.fill(), page.click(), etc.
+    # IMPORTANT: print results so you can read them
+    print(page.title())
+    browser.close()  # just disconnects, does NOT close Chrome
+```
+
+When the prompt says "browser_navigate" -> use page.goto(url)
+When the prompt says "browser_snapshot" -> use page.content() or page.inner_text('body')
+When the prompt says "browser_click" -> use page.click(selector) or page.locator(...).click()
+When the prompt says "browser_fill_form" -> use page.fill(selector, value) for each field
+When the prompt says "browser_file_upload" -> use page.set_input_files(selector, filepath)
+When the prompt says "browser_evaluate" -> use page.evaluate(js_code)
+When the prompt says "browser_take_screenshot" -> use page.screenshot(path='/tmp/screen.png')
+When the prompt says "browser_tabs" -> use context.pages to list, page.bring_to_front() to switch
+When the prompt says "browser_wait_for" -> use page.wait_for_timeout(ms)
+
+IMPORTANT: Always reuse the SAME browser connection. Do not launch a new browser or create new contexts.
 
 == JOB ==
 URL: {job.get('application_url') or job['url']}
