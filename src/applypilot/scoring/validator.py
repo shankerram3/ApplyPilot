@@ -56,6 +56,20 @@ LLM_LEAK_PHRASES: list[str] = [
     "the following cover letter", "the letter below",
 ]
 
+# Placeholder values that users enter in the init wizard meaning "no constraint".
+# When preserved_companies or preserved_school contains one of these, skip the check.
+_PLACEHOLDER_VALUES: frozenset[str] = frozenset({
+    "all of them", "all", "n/a", "none", "unknown", "",
+    "try to keep all of them if not also fine",
+    "keep all", "keep all of them",
+})
+
+
+def _is_placeholder(value: str) -> bool:
+    """Return True if a profile field looks like a placeholder rather than a real entity."""
+    return value.lower().strip() in _PLACEHOLDER_VALUES
+
+
 # Known fabrication markers: completely unrelated tools/languages.
 # Reasonable stretches (K8s, Terraform, Redis, Kafka etc.) are ALLOWED.
 FABRICATION_WATCHLIST: set[str] = {
@@ -124,12 +138,16 @@ def validate_json_fields(data: dict, profile: dict, mode: str = "normal") -> dic
     all_text_parts: list[str] = [data["summary"]]
 
     # Skills: check for fabrication (always enforced)
+    # Cross-reference against the user's declared skills_boundary so that
+    # skills the user actually has are never flagged as fabricated.
+    # Use substring matching: "vue" matches declared skill "vue.js", "c++" matches "c++", etc.
     if isinstance(data["skills"], dict):
         skills_text = " ".join(str(v) for v in data["skills"].values()).lower()
+        allowed_skills = _build_skills_set(profile)
         for fake in FABRICATION_WATCHLIST:
             if len(fake) <= 2:
                 continue
-            if fake in skills_text:
+            if fake in skills_text and not any(fake in s for s in allowed_skills):
                 errors.append(f"Fabricated skill: '{fake}'")
 
     # Experience: preserved companies must be present (always enforced)
@@ -138,6 +156,8 @@ def validate_json_fields(data: dict, profile: dict, mode: str = "normal") -> dic
 
     if isinstance(data["experience"], list):
         for company in preserved_companies:
+            if _is_placeholder(company):
+                continue  # user entered a placeholder — no constraint to enforce
             has_company = any(
                 company.lower() in str(e.get("header", "")).lower()
                 for e in data["experience"]
@@ -156,7 +176,7 @@ def validate_json_fields(data: dict, profile: dict, mode: str = "normal") -> dic
 
     # Education: preserved school must be present (always enforced)
     preserved_school = resume_facts.get("preserved_school", "")
-    if preserved_school:
+    if preserved_school and not _is_placeholder(preserved_school):
         edu = str(data.get("education", ""))
         if preserved_school.lower() not in edu.lower():
             errors.append(f"Education '{preserved_school}' missing")
@@ -221,6 +241,8 @@ def validate_tailored_resume(text: str, profile: dict, original_text: str = "") 
 
     # 3. Check companies preserved
     for company in resume_facts.get("preserved_companies", []):
+        if _is_placeholder(company):
+            continue  # user entered a placeholder — no constraint to enforce
         if company.lower() not in text_lower:
             errors.append(f"Company '{company}' missing -- cannot remove real experience")
 
@@ -231,8 +253,9 @@ def validate_tailored_resume(text: str, profile: dict, original_text: str = "") 
 
     # 5. Check school preserved
     preserved_school = resume_facts.get("preserved_school", "")
-    if preserved_school and preserved_school.lower() not in text_lower:
-        errors.append(f"Education '{preserved_school}' missing")
+    if preserved_school and not _is_placeholder(preserved_school):
+        if preserved_school.lower() not in text_lower:
+            errors.append(f"Education '{preserved_school}' missing")
 
     # 6. Check contact info preserved (warn, don't error -- we can inject)
     email = personal.get("email", "")

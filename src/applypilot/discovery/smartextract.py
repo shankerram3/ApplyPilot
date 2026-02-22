@@ -393,7 +393,7 @@ def judge_api_responses(api_responses: list[dict]) -> list[dict]:
         )
 
         try:
-            raw = client.ask(prompt, temperature=0.0, max_tokens=1024)
+            raw = client.ask(prompt, temperature=0.0, max_tokens=8192)
             verdict = extract_json(raw)
             is_relevant = verdict.get("relevant", False)
             reason = verdict.get("reason", "?")

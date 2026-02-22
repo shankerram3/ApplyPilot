@@ -75,12 +75,14 @@ def _build_profile_summary(profile: dict) -> str:
     lines.append(f"Available: {avail.get('earliest_start_date', 'Immediately')}")
 
     # Standard responses
+    misc = p.get("miscellaneous", {})
+    how_heard = misc.get("how_did_you_hear", "LinkedIn")
     lines.extend([
         "Age 18+: Yes",
         "Background Check: Yes",
         "Felony: No",
         "Previously Worked Here: No",
-        "How Heard: Online Job Board",
+        f"How Heard: {how_heard}",
     ])
 
     # EEO
